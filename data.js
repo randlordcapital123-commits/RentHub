@@ -9,10 +9,28 @@ const Store = (() => {
   const SUPA_CFG = window.RENTHUB_SUPABASE || {};
   const SUPA_URL = SUPA_CFG.url || '';
   const SUPA_KEY = SUPA_CFG.publishableKey || SUPA_CFG.anonKey || '';
-  const SUPA_ENABLED = !!(window.supabase && SUPA_URL && SUPA_KEY);
-  const supabaseClient = SUPA_ENABLED ? window.supabase.createClient(SUPA_URL, SUPA_KEY, {
+  const SUPA_ENABLED = !!(SUPA_URL && SUPA_KEY);
+  // Prefer the official SDK when it has loaded, but keep a REST fallback so the
+  // application does not become dependent on a third-party CDN.
+  const supabaseClient = (window.supabase && SUPA_ENABLED) ? window.supabase.createClient(SUPA_URL, SUPA_KEY, {
     auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true }
   }) : null;
+  const REST_HEADERS = { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}` };
+  const REMOTE_TIMEOUT = 7000;
+  async function withTimeout(promise, ms=REMOTE_TIMEOUT){
+    let timer;
+    try {
+      return await Promise.race([promise, new Promise((_, reject)=>{timer=setTimeout(()=>reject(new Error('Supabase request timed out')),ms)})]);
+    } finally { clearTimeout(timer); }
+  }
+  async function restRequest(path, options={}){
+    const headers = {...REST_HEADERS, ...(options.headers||{})};
+    const res = await withTimeout(fetch(`${SUPA_URL}${path}`, {...options, headers}));
+    const text = await res.text();
+    let body=null; try { body=text?JSON.parse(text):null } catch(_) { body=text; }
+    if(!res.ok) throw new Error(body?.message || body?.error_description || body?.hint || body?.error || `Supabase HTTP ${res.status}`);
+    return body;
+  }
   const REMOTE_TABLE = 'rent_hub_state';
   const REMOTE_ID = 'main';
   let remoteReady = false;
@@ -122,36 +140,57 @@ const Store = (() => {
   }
 
   async function remoteLoad() {
-    if (!supabaseClient) return false;
+    if (!SUPA_ENABLED) { remoteReady = true; return false; }
     try {
-      const { data: row, error } = await supabaseClient.from(REMOTE_TABLE).select('data,updated_at').eq('id', REMOTE_ID).maybeSingle();
-      if (error) throw error;
+      let rows;
+      if (supabaseClient) {
+        const result = await withTimeout(supabaseClient.from(REMOTE_TABLE).select('data,updated_at').eq('id', REMOTE_ID).maybeSingle());
+        if (result.error) throw result.error;
+        rows = result.data ? [result.data] : [];
+      } else {
+        rows = await restRequest(`/rest/v1/${REMOTE_TABLE}?id=eq.${encodeURIComponent(REMOTE_ID)}&select=data,updated_at`);
+      }
+      const row = Array.isArray(rows) ? rows[0] : rows;
       if (row && row.data) {
         const fresh = normalize(row.data);
         Object.keys(data).forEach(k => delete data[k]);
         Object.assign(data, fresh);
         try { localStorage.setItem(DATA_KEY, JSON.stringify(data)); } catch (_) {}
+      } else {
+        // First run: create the remote record from the current local seed/cache.
+        // Never do this until the read has completed successfully.
         remoteReady = true;
-        window.dispatchEvent(new Event('rentHubDataChanged'));
+        await remoteSaveNow();
         return true;
       }
       remoteReady = true;
-      await remoteSaveNow();
+      window.dispatchEvent(new Event('rentHubDataChanged'));
       return true;
     } catch (e) {
+      // Do not hold the entire admin/portal UI hostage to a failed network call.
+      remoteReady = false;
       console.warn('RentHub Supabase load failed; continuing with local cache.', e);
       return false;
     }
   }
 
   async function remoteSaveNow() {
-    if (!supabaseClient || !remoteReady) return false;
+    if (!SUPA_ENABLED || !remoteReady) return false;
     if (remoteWriteBusy) { remoteWriteQueued = true; return false; }
     remoteWriteBusy = true;
     try {
+      syncPropertyCompatibility(data);
       const payload = { id: REMOTE_ID, data: JSON.parse(JSON.stringify(data)), updated_at: new Date().toISOString() };
-      const { error } = await supabaseClient.from(REMOTE_TABLE).upsert(payload, { onConflict: 'id' });
-      if (error) throw error;
+      if (supabaseClient) {
+        const { error } = await withTimeout(supabaseClient.from(REMOTE_TABLE).upsert(payload, { onConflict: 'id' }));
+        if (error) throw error;
+      } else {
+        await restRequest(`/rest/v1/${REMOTE_TABLE}?on_conflict=id`, {
+          method:'POST',
+          headers:{'Content-Type':'application/json','Prefer':'resolution=merge-duplicates,return=minimal'},
+          body:JSON.stringify(payload)
+        });
+      }
       return true;
     } catch (e) {
       console.warn('RentHub Supabase save failed; local cache is still available.', e);
@@ -163,18 +202,25 @@ const Store = (() => {
   }
 
   function scheduleRemoteSave(delay=250) {
-    if (!supabaseClient || !remoteReady) return;
+    if (!SUPA_ENABLED || !remoteReady) return;
     clearTimeout(remoteWriteTimer);
     remoteWriteTimer = setTimeout(remoteSaveNow, delay);
   }
 
   async function initRemote() {
-    if (!supabaseClient) return;
-    await remoteLoad();
+    if (!SUPA_ENABLED) { remoteReady = true; return false; }
+    // The UI must never wait forever for Supabase.
+    try {
+      await Promise.race([
+        remoteLoad(),
+        new Promise(resolve => setTimeout(resolve, REMOTE_TIMEOUT + 500))
+      ]);
+    } catch (_) {}
+    return true;
   }
-  // Do not upload the empty local seed before the remote row has been loaded.
-  // The remote initializer decides whether to hydrate or create the first row.
-  const ready = initRemote();
+  // Store.ready always resolves. A failed/slow Supabase request must not leave
+  // every admin, landlord, agent or public page stuck on "Loading…".
+  const ready = initRemote().catch(e => { console.warn('RentHub remote init error',e); remoteReady=false; return false; });
 
   function log(action,detail) {
     const now = new Date().toISOString();
@@ -197,13 +243,17 @@ const Store = (() => {
   function makePreview(blob){return new Promise((resolve,reject)=>{const rd=new FileReader();rd.onerror=()=>reject(rd.error);rd.onload=()=>{const img=new Image();img.onload=()=>{const max=1400,scale=Math.min(1,max/Math.max(img.width,img.height));const c=document.createElement("canvas");c.width=Math.max(1,Math.round(img.width*scale));c.height=Math.max(1,Math.round(img.height*scale));c.getContext("2d").drawImage(img,0,0,c.width,c.height);resolve(c.toDataURL("image/jpeg",.78))};img.onerror=()=>reject(new Error("Invalid image"));img.src=rd.result};rd.readAsDataURL(blob)})}
   function isRemoteImage(ref){return /^https?:\/\//i.test(String(ref||'')) && String(ref).includes('supabase');}
   async function putImage(blob){
-    if(supabaseClient){
+    if(SUPA_ENABLED){
       try {
         const ext=(blob.name||'image.jpg').split('.').pop().toLowerCase().replace(/[^a-z0-9]/g,'')||'jpg';
         const path=`rooms/${Date.now()}_${Math.random().toString(36).slice(2,10)}.${ext}`;
-        const {error}=await supabaseClient.storage.from('renthub-images').upload(path,blob,{cacheControl:'31536000',upsert:false,contentType:blob.type||'image/jpeg'});
-        if(!error){const {data:pub}=supabaseClient.storage.from('renthub-images').getPublicUrl(path);if(pub?.publicUrl)return pub.publicUrl;}
-        console.warn('Supabase image upload failed; using local fallback.');
+        if (supabaseClient) {
+          const {error}=await withTimeout(supabaseClient.storage.from('renthub-images').upload(path,blob,{cacheControl:'31536000',upsert:false,contentType:blob.type||'image/jpeg'}));
+          if(!error){const {data:pub}=supabaseClient.storage.from('renthub-images').getPublicUrl(path);if(pub?.publicUrl)return pub.publicUrl;}
+          throw error || new Error('Could not create public image URL');
+        }
+        await restRequest(`/storage/v1/object/renthub-images/${path}`, {method:'POST',headers:{'Content-Type':blob.type||'image/jpeg','x-upsert':'false'},body:blob});
+        return `${SUPA_URL}/storage/v1/object/public/renthub-images/${path}`;
       } catch(e){console.warn('Supabase image upload failed; using local fallback.',e)}
     }
     const key=uid("IMG"),ref="local:"+key;try{const db=await openImageDB();await new Promise((res,rej)=>{const tx=db.transaction(IMAGE_STORE,"readwrite");tx.objectStore(IMAGE_STORE).put(blob,key);tx.oncomplete=res;tx.onerror=()=>rej(tx.error)});try{writePreview(ref,await makePreview(blob))}catch(e){}return ref}catch(e){return await makePreview(blob)}}
@@ -211,7 +261,7 @@ const Store = (() => {
   async function deleteImage(ref){
     if(!ref)return;
     if(isRemoteImage(ref)&&supabaseClient){
-      try { const marker='/storage/v1/object/public/renthub-images/'; const i=ref.indexOf(marker); if(i>=0){const path=decodeURIComponent(ref.slice(i+marker.length)); await supabaseClient.storage.from('renthub-images').remove([path]);} } catch(e){console.warn('Remote image delete failed',e)}
+      try { const marker='/storage/v1/object/public/renthub-images/'; const i=ref.indexOf(marker); if(i>=0){const path=decodeURIComponent(ref.slice(i+marker.length)); if(supabaseClient){await withTimeout(supabaseClient.storage.from('renthub-images').remove([path]));} else {await restRequest(`/storage/v1/object/renthub-images/${path}`,{method:'DELETE'});} } } catch(e){console.warn('Remote image delete failed',e)}
       return;
     }
     if(!ref.startsWith("local:"))return;try{const db=await openImageDB();await new Promise((res,rej)=>{const tx=db.transaction(IMAGE_STORE,"readwrite");tx.objectStore(IMAGE_STORE).delete(ref.slice(6));tx.oncomplete=res;tx.onerror=()=>rej(tx.error)});const p=readPreviews();delete p[ref];try{localStorage.setItem(PREVIEW_KEY,JSON.stringify(p))}catch(e){}}catch(e){}}
@@ -235,5 +285,5 @@ const Store = (() => {
   document.addEventListener("visibilitychange",()=>{if(!document.hidden){refresh(); if(supabaseClient) remoteLoad(); window.dispatchEvent(new Event("rentHubDataChanged"))}});
   window.addEventListener('online',()=>{if(supabaseClient){remoteLoad();scheduleRemoteSave(100)}});
 
-  return {get data(){return data},save,log,uid,escapeHtml:esc,money,refresh,getRoom,getProperty,sync:()=>syncPropertyCompatibility(data),putImage,getImage,deleteImage,hydrateImages,releaseObjectUrls,initRemote,ready,remoteEnabled:()=>!!supabaseClient,DEFAULT_IMG,isLoggedIn,login,logout,isLandlordLoggedIn,currentLandlord,loginLandlord,logoutLandlord,isAgentLoggedIn,currentAgent,loginAgent,logoutAgent};
+  return {get data(){return data},save,log,uid,escapeHtml:esc,money,refresh,getRoom,getProperty,sync:()=>syncPropertyCompatibility(data),putImage,getImage,deleteImage,hydrateImages,releaseObjectUrls,initRemote,ready,remoteEnabled:()=>SUPA_ENABLED,remoteStatus:()=>({configured:SUPA_ENABLED,connected:remoteReady}),DEFAULT_IMG,isLoggedIn,login,logout,isLandlordLoggedIn,currentLandlord,loginLandlord,logoutLandlord,isAgentLoggedIn,currentAgent,loginAgent,logoutAgent};
 })();
