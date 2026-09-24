@@ -1,0 +1,14 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Admin Login — Rental Admin</title><link rel="stylesheet" href="css/admin.css"></head>
+<body class="login-body">
+<div class="login-card">
+<div class="brand">RENTAL <b>ADMIN</b></div>
+<h1>Admin sign in</h1>
+<form id="loginForm">
+<input id="user" name="username" required placeholder="Username" autocomplete="username">
+<input id="pass" name="password" required type="password" placeholder="Password" autocomplete="current-password">
+<button class="btn primary" type="submit">Sign in</button>
+</form>
+<div id="loginResult"></div>
+<a class="back-link" href="../index.html">← Back to public website</a>
+</div>
+<script src="../supabase-config.js"></script><script src="../data.js"></script><script>Store.ready.then(()=>{const d=Store.data,form=document.getElementById('loginForm'),heading=document.querySelector('h1');if(!d.settings.username||!d.settings.password){heading.textContent='Create admin account';form.querySelector('button').textContent='Create admin account';form.onsubmit=async e=>{e.preventDefault();const f=new FormData(form),u=String(f.get('username')||'').trim(),p=String(f.get('password')||'');if(u.length<3||p.length<8){alert('Use a username of at least 3 characters and a password of at least 8 characters.');return}d.settings.username=u;d.settings.password=p;try{await Store.save();await Store.login(u,p);location.href='index.html?session='+encodeURIComponent(Store.sessionToken())}catch(err){alert('Supabase could not save the account: '+err.message)}}}else{form.onsubmit=async e=>{e.preventDefault();const f=new FormData(form);try{if(await Store.login(f.get('username'),f.get('password')))location.href='index.html?session='+encodeURIComponent(Store.sessionToken());}catch(err){alert('Invalid credentials or Supabase error: '+err.message)}}}});</script></body></body></html>
